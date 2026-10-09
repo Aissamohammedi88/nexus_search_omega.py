@@ -1,2 +1,14 @@
 # Google App Engine generated folder
 appengine-generated/
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store
+.venv/
+venv/
+env/
+.vscode/
+.idea/

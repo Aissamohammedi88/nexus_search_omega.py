@@ -1,0 +1,1583 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+# ═══════════════════════════════════════════════════════════════════════════
+# NEXUS SEARCH · OMEGA EDITION v3.0.0
+# Multi-Source Meta Search Engine + Persistent Local Indexer
+# ─────────────────────────────────────────────────────────────────────────
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+# Port par defaut : 8902
+# ═══════════════════════════════════════════════════════════════════════════
+
+import os
+import re
+import sys
+import gzip
+import json
+import time
+import math
+import ssl
+import html
+import uuid
+import socket
+import sqlite3
+import hashlib
+import datetime
+import threading
+import urllib.request
+import urllib.parse
+import urllib.error
+import urllib.robotparser
+from collections import OrderedDict, defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1 · CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+VERSION = "3.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+
+GIT = {
+"repo": "https://github.com/aissa-mohammedi/nexus-search-omega",
+"raw_engine": "https://raw.githubusercontent.com/aissa-mohammedi/nexus-search-omega/main/nexus_search_omega.py",
+"raw_indexer": "https://raw.githubusercontent.com/aissa-mohammedi/nexus-search-omega/main/applio_indexer_v4.py",
+}
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, "Documents", "nexus_search_omega")
+CACHE_DIR = os.path.join(BASE, "cache")
+LOGS_DIR = os.path.join(BASE, "logs")
+DOCS_DIR = os.path.join(BASE, "docs")
+DB_FILE = os.path.join(BASE, "index.db")
+LOG_FILE = os.path.join(LOGS_DIR, "search.log")
+INDEXER_LOG = os.path.join(LOGS_DIR, "indexer.log")
+
+for d in (BASE, CACHE_DIR, LOGS_DIR, DOCS_DIR):
+try:
+os.makedirs(d, exist_ok=True)
+except OSError:
+pass
+
+PORT = int(os.environ.get("PORT", 8902))
+HOST = "0.0.0.0"
+
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+UA = "Mozilla/5.0 (compatible; NexusSearch/3.0)"
+
+CACHE = OrderedDict()
+CACHE_LOCK = threading.RLock()
+CACHE_MAX = 5000
+CACHE_TTL = 300
+
+DEFAULT_WORKERS = 8
+MAX_WORKERS = 32
+MAX_PAGE_SIZE = 2 * 1024 * 1024
+DEFAULT_TIMEOUT = 6
+SIMHASH_THRESHOLD = 3
+
+STOPWORDS_FR = {
+"le", "la", "les", "un", "une", "des", "du", "de", "et", "ou", "mais",
+"donc", "or", "ni", "car", "que", "qui", "quoi", "dont", "a", "au",
+"aux", "ce", "cet", "cette", "ces", "son", "sa", "ses", "mon", "ma",
+"mes", "ton", "ta", "tes", "notre", "nos", "votre", "vos", "leur",
+"leurs", "je", "tu", "il", "elle", "nous", "vous", "ils", "elles",
+"etre", "avoir", "faire", "dire", "pour", "par", "avec", "sans", "sur",
+"sous", "dans", "entre", "vers", "chez", "est", "sont", "etait", "plus",
+"moins", "tres", "peu", "bien", "mal", "tout", "tous", "toute", "toutes",
+"aussi", "comme", "alors", "ainsi", "apres", "avant", "depuis", "encore",
+}
+STOPWORDS_EN = {
+"the", "a", "an", "and", "or", "but", "so", "for", "nor", "yet", "of",
+"to", "in", "on", "at", "by", "with", "from", "into", "through", "during",
+"before", "after", "above", "below", "between", "under", "over", "is",
+"are", "was", "were", "be", "been", "being", "have", "has", "had", "do",
+"does", "did", "will", "would", "could", "should", "may", "might", "must",
+"can", "this", "that", "these", "those", "i", "you", "he", "she", "it",
+"we", "they", "me", "him", "her", "us", "them", "my", "your", "his",
+"its", "our", "their", "what", "which", "who", "whom", "whose", "where",
+"when", "why", "how", "all", "any", "both", "each", "few", "more", "most",
+"other", "some", "such", "no", "not", "only", "own", "same", "than", "too",
+}
+STOPWORDS = STOPWORDS_FR | STOPWORDS_EN
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2 · LOGGER
+# ═══════════════════════════════════════════════════════════════════════════
+
+LOG_LOCK = threading.RLock()
+
+
+def log(msg, to_file=None):
+ts = time.strftime("%Y-%m-%d %H:%M:%S")
+try:
+safe = str(msg).encode("ascii", "ignore").decode("ascii")
+except Exception:
+safe = str(msg)
+line = "[{}] {}".format(ts, safe)
+try:
+print(line, flush=True)
+except Exception:
+pass
+target = to_file or LOG_FILE
+with LOG_LOCK:
+try:
+with open(target, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+
+def ilog(msg):
+log(msg, to_file=INDEXER_LOG)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3 · UTILITAIRES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def now_iso():
+return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def sha256_bytes(data):
+return hashlib.sha256(data).hexdigest()
+
+
+def simhash(text, bits=64):
+if not text:
+return 0
+tokens = tokenize(text)
+if not tokens:
+return 0
+v = [0] * bits
+for tok in tokens:
+h = int(hashlib.md5(tok.encode("utf-8", "ignore")).hexdigest()[:16], 16)
+for i in range(bits):
+v[i] += 1 if (h & (1 << i)) else -1
+out = 0
+for i in range(bits):
+if v[i] > 0:
+out |= (1 << i)
+return out
+
+
+def hamming(a, b):
+return bin(a ^ b).count("1")
+
+
+_word_rx = re.compile(
+r"[a-zA-ZàâäéèêëïîôöùûüçÀÂÄÉÈÊËÏÎÔÖÙÛÜÇ]"
+r"[a-zA-ZàâäéèêëïîôöùûüçÀÂÄÉÈÊËÏÎÔÖÙÛÜÇ0-9'\-]*", re.UNICODE)
+
+
+def tokenize(text):
+if not text:
+return []
+words = _word_rx.findall(text.lower())
+return [w.strip("'-") for w in words
+if 3 <= len(w) <= 30 and w not in STOPWORDS]
+
+
+def detect_lang(text):
+if not text:
+return "fr"
+s = text[:3000].lower()
+fr = sum(1 for w in ["le", "la", "les", "un", "une", "des", "et", "est"] if w in s)
+en = sum(1 for w in ["the", "a", "an", "and", "is", "are", "in", "of"] if w in s)
+return "fr" if fr >= en else "en"
+
+
+def strip_html(s):
+if not s:
+return ""
+s = re.sub(r"<[^>]+>", " ", s)
+s = html.unescape(s)
+s = re.sub(r"\s+", " ", s)
+return s.strip()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4 · CACHE LRU
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cache_get(key):
+with CACHE_LOCK:
+if key in CACHE:
+ts, data = CACHE[key]
+if time.time() - ts < CACHE_TTL:
+CACHE.move_to_end(key)
+return data
+del CACHE[key]
+return None
+
+
+def cache_set(key, data):
+with CACHE_LOCK:
+CACHE[key] = (time.time(), data)
+while len(CACHE) > CACHE_MAX:
+CACHE.popitem(last=False)
+
+
+def cache_stats():
+with CACHE_LOCK:
+return {"size": len(CACHE), "max": CACHE_MAX, "ttl": CACHE_TTL}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 · HTTP CLIENT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def http_get(url, timeout=8, headers=None, max_size=2_000_000):
+h = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "gzip"}
+if headers:
+h.update(headers)
+try:
+req = urllib.request.Request(url, headers=h)
+t0 = time.time()
+with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+raw = r.read(max_size)
+if r.headers.get("Content-Encoding", "").lower() == "gzip":
+try:
+raw = gzip.decompress(raw)
+except Exception:
+pass
+return {
+"ok": True,
+"body": raw.decode("utf-8", "ignore"),
+"status": r.status,
+"ms": round((time.time() - t0) * 1000),
+}
+except urllib.error.HTTPError as e:
+return {"ok": False, "err": "HTTP " + str(e.code), "status": e.code}
+except Exception as e:
+return {"ok": False, "err": str(e)[:120], "status": 0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 6 · SOURCES EXTERNES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def src_duckduckgo(query):
+q = urllib.parse.quote(query)
+url = "https://api.duckduckgo.com/?q=" + q + "&format=json&no_html=1&skip_disambig=1"
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+out = []
+if data.get("AbstractText"):
+out.append({
+"title": data.get("Heading", query),
+"snippet": data["AbstractText"][:500],
+"url": data.get("AbstractURL", ""),
+"source": "DuckDuckGo",
+"score": 90,
+})
+for t in data.get("RelatedTopics", [])[:8]:
+if isinstance(t, dict) and "Text" in t:
+out.append({
+"title": strip_html(t.get("Text", ""))[:120],
+"snippet": strip_html(t.get("Text", ""))[:400],
+"url": t.get("FirstURL", ""),
+"source": "DuckDuckGo",
+"score": 60,
+})
+return out
+
+
+def src_wikipedia(query):
+q = urllib.parse.quote(query)
+url = "https://fr.wikipedia.org/api/rest_v1/page/summary/" + q
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+if "extract" not in data:
+return []
+return [{
+"title": data.get("title", query),
+"snippet": data.get("extract", "")[:600],
+"url": data.get("content_urls", {}).get("desktop", {}).get("page", ""),
+"source": "Wikipedia",
+"score": 95,
+}]
+
+
+def src_github(query):
+q = urllib.parse.quote(query)
+url = "https://api.github.com/search/repositories?q=" + q + "&per_page=5"
+r = http_get(url, timeout=6, headers={"Accept": "application/vnd.github.v3+json"})
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+out = []
+for i in data.get("items", [])[:5]:
+out.append({
+"title": i.get("full_name", ""),
+"snippet": (i.get("description") or "")[:200] + " ★ " + str(i.get("stargazers_count", 0)),
+"url": i.get("html_url", ""),
+"source": "GitHub",
+"score": 75,
+})
+return out
+
+
+def src_hn(query):
+q = urllib.parse.quote(query)
+url = "https://hn.algolia.com/api/v1/search?query=" + q + "&tags=story&hitsPerPage=5"
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+out = []
+for h in data.get("hits", [])[:5]:
+out.append({
+"title": h.get("title") or h.get("story_title") or "",
+"snippet": "HN · {} pts · {} comm".format(h.get("points", 0), h.get("num_comments", 0)),
+"url": h.get("url") or ("https://news.ycombinator.com/item?id=" + str(h.get("objectID", ""))),
+"source": "HackerNews",
+"score": 65,
+})
+return out
+
+
+def src_arxiv(query):
+q = urllib.parse.quote(query)
+url = "http://export.arxiv.org/api/query?search_query=all:" + q + "&max_results=3"
+r = http_get(url, timeout=6)
+if not r.get("ok"):
+return []
+out = []
+for e in re.findall(r"<entry>(.*?)</entry>", r["body"], re.DOTALL)[:3]:
+t = re.search(r"<title>(.*?)</title>", e, re.DOTALL)
+s = re.search(r"<summary>(.*?)</summary>", e, re.DOTALL)
+l = re.search(r"<id>(.*?)</id>", e, re.DOTALL)
+if t and s:
+out.append({
+"title": t.group(1).strip()[:150],
+"snippet": s.group(1).strip()[:300],
+"url": l.group(1).strip() if l else "",
+"source": "ArXiv",
+"score": 80,
+})
+return out
+
+
+def src_stackoverflow(query):
+q = urllib.parse.quote(query)
+url = ("https://api.stackexchange.com/2.3/search/advanced?"
+"order=desc&sort=relevance&q=" + q + "&site=stackoverflow&pagesize=5")
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+out = []
+for i in data.get("items", [])[:5]:
+out.append({
+"title": i.get("title", ""),
+"snippet": "Score {} · Reponses {}".format(i.get("score", 0), i.get("answer_count", 0)),
+"url": i.get("link", ""),
+"source": "StackOverflow",
+"score": 70,
+})
+return out
+
+
+def src_wikidata(query):
+q = urllib.parse.quote(query)
+url = ("https://www.wikidata.org/w/api.php?action=wbsearchentities"
+"&search=" + q + "&language=fr&limit=3&format=json")
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+out = []
+for item in data.get("search", [])[:3]:
+out.append({
+"title": item.get("label", ""),
+"snippet": item.get("description", ""),
+"url": "https://www.wikidata.org/wiki/" + item.get("id", ""),
+"source": "Wikidata",
+"score": 55,
+})
+return out
+
+
+def src_mdn(query):
+q = urllib.parse.quote(query)
+url = "https://developer.mozilla.org/api/v1/search?q=" + q + "&locale=en-US"
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+out = []
+for doc in data.get("documents", [])[:5]:
+out.append({
+"title": doc.get("title", ""),
+"snippet": (doc.get("summary") or "")[:300],
+"url": "https://developer.mozilla.org" + doc.get("mdn_url", ""),
+"source": "MDN",
+"score": 78,
+})
+return out
+
+
+def src_npm(query):
+q = urllib.parse.quote(query)
+url = "https://registry.npmjs.org/-/v1/search?text=" + q + "&size=5"
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+out = []
+for obj in data.get("objects", [])[:5]:
+pkg = obj.get("package", {})
+out.append({
+"title": pkg.get("name", ""),
+"snippet": (pkg.get("description") or "")[:200],
+"url": pkg.get("links", {}).get("npm", ""),
+"source": "npm",
+"score": 60,
+})
+return out
+
+
+def src_pypi(query):
+q = urllib.parse.quote(query)
+url = "https://pypi.org/pypi/" + q + "/json"
+r = http_get(url, timeout=5)
+if not r.get("ok"):
+return []
+try:
+data = json.loads(r["body"])
+except Exception:
+return []
+info = data.get("info", {})
+return [{
+"title": info.get("name", query),
+"snippet": (info.get("summary") or "")[:300],
+"url": info.get("project_url", "https://pypi.org/project/" + query),
+"source": "PyPI",
+"score": 60,
+}]
+
+
+SOURCES = [
+src_duckduckgo,
+src_wikipedia,
+src_github,
+src_hn,
+src_arxiv,
+src_stackoverflow,
+src_wikidata,
+src_mdn,
+src_npm,
+src_pypi,
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 7 · RANKING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def rank(results, query):
+words = set(re.findall(r"\w+", query.lower()))
+seen = set()
+out = []
+for r in results:
+url = (r.get("url") or "").strip()
+if not url:
+continue
+key = url.split("#")[0].split("?")[0].lower()
+if key in seen:
+continue
+seen.add(key)
+score = r.get("score", 50)
+title_low = (r.get("title") or "").lower()
+snippet_low = (r.get("snippet") or "").lower()
+for w in words:
+if w in title_low:
+score += 8
+if w in snippet_low:
+score += 3
+if url.startswith("https://"):
+score += 3
+if r.get("source") in ("Wikipedia", "DuckDuckGo", "MDN"):
+score += 10
+r["score_final"] = score
+out.append(r)
+out.sort(key=lambda x: -x["score_final"])
+return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 8 · LOCAL INDEX
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LocalIndex:
+def __init__(self, path=DB_FILE):
+self.path = str(path)
+self.local = threading.local()
+self.lock = threading.RLock()
+self._init()
+
+def _conn(self):
+if not hasattr(self.local, "conn"):
+conn = sqlite3.connect(self.path, timeout=30,
+check_same_thread=False, isolation_level=None)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA synchronous=NORMAL")
+conn.execute("PRAGMA cache_size=-64000")
+conn.execute("PRAGMA temp_store=MEMORY")
+self.local.conn = conn
+return self.local.conn
+
+def _init(self):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"CREATE TABLE IF NOT EXISTS pages ("
+"id INTEGER PRIMARY KEY AUTOINCREMENT,"
+"url TEXT UNIQUE,"
+"title TEXT,"
+"snippet TEXT,"
+"source TEXT,"
+"score INTEGER,"
+"added_at REAL)"
+)
+cur.execute("CREATE INDEX IF NOT EXISTS idx_url ON pages(url)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_source ON pages(source)")
+cur.execute(
+"CREATE TABLE IF NOT EXISTS terms ("
+"term TEXT,"
+"page_id INTEGER,"
+"freq INTEGER,"
+"PRIMARY KEY (term, page_id))"
+)
+cur.execute("CREATE INDEX IF NOT EXISTS idx_term ON terms(term)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_page ON terms(page_id)")
+conn.commit()
+
+def add_page(self, url, title, snippet, source, score):
+if not url:
+return None
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+try:
+cur.execute(
+"INSERT OR IGNORE INTO pages "
+"(url,title,snippet,source,score,added_at) VALUES (?,?,?,?,?,?)",
+(url, (title or "")[:500], (snippet or "")[:1000],
+source, score, time.time())
+)
+if cur.rowcount == 0:
+cur.execute("SELECT id FROM pages WHERE url = ?", (url,))
+r = cur.fetchone()
+return r[0] if r else None
+return cur.lastrowid
+except Exception as e:
+log("add_page err " + str(e)[:80])
+return None
+
+def index_page_terms(self, page_id, text):
+if not page_id or not text:
+return 0
+words = tokenize(text)
+if not words:
+return 0
+freq = Counter(words)
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+try:
+cur.executemany(
+"INSERT OR REPLACE INTO terms (term,page_id,freq) VALUES (?,?,?)",
+[(w, page_id, n) for w, n in freq.items()]
+)
+return len(freq)
+except Exception:
+return 0
+
+def search_local(self, query, limit=20):
+words = tokenize(query)
+if not words:
+return []
+ph = ",".join("?" * len(words))
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"SELECT page_id, SUM(freq) AS s FROM terms WHERE term IN (" +
+ph + ") GROUP BY page_id ORDER BY s DESC LIMIT ?",
+words + [limit]
+)
+ids = [r[0] for r in cur.fetchall()]
+if not ids:
+return []
+ph2 = ",".join("?" * len(ids))
+cur.execute(
+"SELECT id,url,title,snippet,source,score FROM pages WHERE id IN (" + ph2 + ")",
+ids
+)
+out = []
+for r in cur.fetchall():
+out.append({
+"id": r[0],
+"url": r[1],
+"title": r[2],
+"snippet": r[3],
+"source": "INDEX:" + (r[4] or ""),
+"score": (r[5] or 50) + 20,
+"score_final": (r[5] or 50) + 20,
+})
+return out
+
+def stats(self):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM pages")
+p = cur.fetchone()[0] or 0
+cur.execute("SELECT COUNT(*) FROM terms")
+t = cur.fetchone()[0] or 0
+return {"pages": p, "terms": t}
+
+def top_terms(self, limit=20):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"SELECT term, COUNT(DISTINCT page_id) AS df FROM terms "
+"GROUP BY term ORDER BY df DESC LIMIT ?", (limit,)
+)
+return [{"term": r[0], "df": r[1]} for r in cur.fetchall()]
+
+def recent(self, limit=10):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"SELECT url,title,source,added_at FROM pages ORDER BY id DESC LIMIT ?",
+(limit,)
+)
+return [{"url": r[0], "title": r[1], "source": r[2], "ts": r[3]}
+for r in cur.fetchall()]
+
+
+IDX = LocalIndex()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 9 · SEARCH PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def search(query, lang="fr", limit=40):
+if not query or not query.strip():
+return {"query": query, "results": [], "count": 0, "sources": []}
+
+ck = (query.lower(), lang, limit)
+cached = cache_get(ck)
+if cached:
+cached["cached"] = True
+return cached
+
+t0 = time.time()
+log("SEARCH : " + query)
+
+internal = IDX.search_local(query, limit=limit)
+
+external = []
+with ThreadPoolExecutor(max_workers=min(len(SOURCES), 12)) as ex:
+futures = [ex.submit(fn, query) for fn in SOURCES]
+for fut in as_completed(futures, timeout=20):
+try:
+res = fut.result(timeout=12)
+if res:
+external.extend(res)
+except Exception:
+pass
+
+ranked = rank(internal + external, query)
+
+def _idx(results):
+for r in results[:20]:
+pid = IDX.add_page(
+r.get("url"),
+r.get("title"),
+r.get("snippet"),
+r.get("source"),
+r.get("score", 50)
+)
+if pid:
+IDX.index_page_terms(
+pid,
+(r.get("title") or "") + " " + (r.get("snippet") or "")
+)
+
+threading.Thread(target=_idx, args=(external,), daemon=True).start()
+
+duration_ms = round((time.time() - t0) * 1000, 2)
+result = {
+"query": query,
+"lang": lang,
+"timestamp": datetime.datetime.now().isoformat(),
+"count": len(ranked),
+"sources": sorted(set(r.get("source", "") for r in ranked if r.get("source"))),
+"duration_ms": duration_ms,
+"internal_matches": len(internal),
+"external_matches": len(external),
+"cached": False,
+"results": ranked[:limit],
+}
+cache_set(ck, result)
+log("DONE {} results in {}ms (int={} ext={})".format(
+len(ranked), duration_ms, len(internal), len(external)))
+return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 10 · HTML PARSER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HTMLExtractor(HTMLParser):
+def __init__(self, base_url=""):
+super().__init__()
+self.base_url = base_url
+self.title = ""
+self.description = ""
+self.text_parts = []
+self.links = []
+self._in_title = False
+self._in_script = False
+self._in_style = False
+self._in_head = False
+
+def handle_starttag(self, tag, attrs):
+a = dict(attrs)
+tag = tag.lower()
+if tag == "title":
+self._in_title = True
+elif tag == "script":
+self._in_script = True
+elif tag == "style":
+self._in_style = True
+elif tag == "head":
+self._in_head = True
+elif tag == "meta":
+n = (a.get("name") or "").lower()
+p = (a.get("property") or "").lower()
+c = a.get("content", "")
+if n == "description" or p == "og:description":
+self.description = c[:500]
+elif p == "og:title" and not self.title:
+self.title = c[:200]
+elif tag == "a":
+href = a.get("href", "")
+if href and not href.startswith(("javascript:", "mailto:", "#")):
+self.links.append(urllib.parse.urljoin(self.base_url, href))
+
+def handle_endtag(self, tag):
+t = tag.lower()
+if t == "title":
+self._in_title = False
+elif t == "script":
+self._in_script = False
+elif t == "style":
+self._in_style = False
+elif t == "head":
+self._in_head = False
+
+def handle_data(self, data):
+if self._in_script or self._in_style:
+return
+if self._in_title:
+self.title += data
+elif not self._in_head:
+s = data.strip()
+if s:
+self.text_parts.append(s)
+
+def result(self):
+return {
+"title": self.title.strip()[:300],
+"description": self.description.strip(),
+"text": " ".join(self.text_parts)[:300000],
+"links": self.links[:300],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 11 · INDEXER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Indexer:
+def __init__(self):
+self.lock = threading.RLock()
+self.running = False
+self.workers = []
+self.num_workers = DEFAULT_WORKERS
+self.stats = {
+"pages_fetched": 0,
+"pages_indexed": 0,
+"pages_failed": 0,
+"pages_duplicate": 0,
+"links_found": 0,
+"started_at": None,
+"rate_per_min": 0,
+"last_page": "",
+}
+self.robots = {}
+self.robots_lock = threading.RLock()
+self.queue = []
+self.queue_lock = threading.RLock()
+self.seen_urls = set()
+self.seen_lock = threading.RLock()
+self.simhashes = {}
+self.simhash_lock = threading.RLock()
+
+def add_url(self, url, priority=5):
+if not url:
+return False
+if not url.startswith(("http://", "https://")):
+url = "https://" + url
+with self.seen_lock:
+if url in self.seen_urls:
+return False
+self.seen_urls.add(url)
+with self.queue_lock:
+self.queue.append((priority, url))
+self.queue.sort(key=lambda x: x[0])
+return True
+
+def queue_size(self):
+with self.queue_lock:
+return len(self.queue)
+
+def can_fetch(self, url):
+try:
+p = urllib.parse.urlparse(url)
+dom = p.netloc
+with self.robots_lock:
+if dom in self.robots:
+rp = self.robots[dom]
+else:
+rp = urllib.robotparser.RobotFileParser()
+rp.set_url(p.scheme + "://" + dom + "/robots.txt")
+try:
+rp.read()
+except Exception:
+rp = None
+self.robots[dom] = rp
+if rp is None:
+return True
+return rp.can_fetch(UA, url)
+except Exception:
+return True
+
+def is_dup(self, sh):
+with self.simhash_lock:
+for known in self.simhashes:
+if hamming(sh, known) <= SIMHASH_THRESHOLD:
+return True
+self.simhashes[sh] = time.time()
+return False
+
+def fetch(self, url, timeout=DEFAULT_TIMEOUT):
+try:
+req = urllib.request.Request(url, headers={
+"User-Agent": UA,
+"Accept": "text/html,application/xhtml+xml",
+"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+"Accept-Encoding": "gzip",
+})
+with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+ct = r.headers.get("Content-Type", "").lower()
+if "text/html" not in ct and "application/xhtml" not in ct:
+return None
+raw = r.read(MAX_PAGE_SIZE + 1)
+if len(raw) > MAX_PAGE_SIZE:
+raw = raw[:MAX_PAGE_SIZE]
+if r.headers.get("Content-Encoding", "").lower() == "gzip":
+try:
+raw = gzip.decompress(raw)
+except Exception:
+pass
+enc = "utf-8"
+m = re.search(r"charset=([\w\-]+)", ct)
+if m:
+enc = m.group(1)
+return raw.decode(enc, errors="ignore")
+except Exception:
+return None
+
+def index_url(self, url):
+if not self.can_fetch(url):
+return None
+html_txt = self.fetch(url)
+if not html_txt:
+with self.lock:
+self.stats["pages_failed"] += 1
+return None
+try:
+parser = HTMLExtractor(base_url=url)
+parser.feed(html_txt)
+data = parser.result()
+except Exception:
+with self.lock:
+self.stats["pages_failed"] += 1
+return None
+
+title = data["title"] or url
+description = data["description"]
+content = data["text"]
+if len(content) < 100:
+with self.lock:
+self.stats["pages_failed"] += 1
+return None
+
+sh = simhash(title + " " + content[:5000])
+if self.is_dup(sh):
+with self.lock:
+self.stats["pages_duplicate"] += 1
+return None
+
+domain = urllib.parse.urlparse(url).netloc
+pid = IDX.add_page(url, title, description or content[:500], "CRAWL", 60)
+if pid:
+IDX.index_page_terms(pid, title + " " + content[:50000])
+
+with self.lock:
+self.stats["pages_fetched"] += 1
+self.stats["pages_indexed"] += 1
+self.stats["links_found"] += len(data["links"])
+self.stats["last_page"] = url
+
+for link in data["links"]:
+link_dom = urllib.parse.urlparse(link).netloc
+prio = 3 if link_dom == domain else 7
+self.add_url(link, priority=prio)
+
+return {"url": url, "title": title[:80]}
+
+def worker_loop(self, wid):
+while self.running:
+batch = []
+with self.queue_lock:
+batch = self.queue[:8]
+self.queue = self.queue[8:]
+if not batch:
+time.sleep(0.3)
+continue
+for prio, url in batch:
+if not self.running:
+return
+try:
+r = self.index_url(url)
+if r:
+ilog("[W{}] {}".format(wid, r["url"][:90]))
+except Exception as e:
+ilog("[W{}] err {}".format(wid, str(e)[:100]))
+
+def start(self, num_workers=None):
+if self.running:
+return False
+self.num_workers = num_workers or DEFAULT_WORKERS
+self.num_workers = max(2, min(MAX_WORKERS, self.num_workers))
+self.running = True
+self.stats["started_at"] = time.time()
+for i in range(self.num_workers):
+t = threading.Thread(target=self.worker_loop, args=(i,), daemon=True)
+t.start()
+self.workers.append(t)
+ilog("Indexer demarre : {} workers".format(self.num_workers))
+return True
+
+def stop(self):
+self.running = False
+ilog("Indexer arrete")
+
+def status(self):
+with self.lock:
+s = dict(self.stats)
+elapsed = time.time() - s["started_at"] if s["started_at"] else 0
+if elapsed > 0:
+s["rate_per_min"] = round(s["pages_indexed"] / elapsed * 60, 1)
+s["elapsed_s"] = round(elapsed, 1)
+s["running"] = self.running
+s["workers"] = self.num_workers
+s["queue"] = self.queue_size()
+return s
+
+
+INDEXER = Indexer()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 12 · SEEDS
+# ═══════════════════════════════════════════════════════════════════════════
+
+DEFAULT_SEEDS = [
+("https://fr.wikipedia.org/wiki/Python_(langage)", 1),
+("https://fr.wikipedia.org/wiki/Intelligence_artificielle", 1),
+("https://fr.wikipedia.org/wiki/Moteur_de_recherche", 1),
+("https://fr.wikipedia.org/wiki/World_Wide_Web", 1),
+("https://fr.wikipedia.org/wiki/Internet", 1),
+("https://en.wikipedia.org/wiki/Search_engine", 1),
+("https://en.wikipedia.org/wiki/Web_crawler", 1),
+("https://en.wikipedia.org/wiki/Information_retrieval", 1),
+("https://news.ycombinator.com/", 5),
+("https://lobste.rs/", 5),
+]
+
+
+def seed_indexer():
+n = 0
+for url, prio in DEFAULT_SEEDS:
+if INDEXER.add_url(url, priority=prio):
+n += 1
+return n
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 13 · HTML PAGE (ULTRA)
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000">
+<title>NEXUS SEARCH · OMEGA</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-font-smoothing:antialiased}
+html,body{width:100%;min-height:100%;background:#000;color:#fff;
+font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",system-ui,sans-serif}
+body{overflow-y:auto;padding-bottom:80px}
+.bg{position:fixed;inset:0;z-index:0;background:
+radial-gradient(ellipse at 15% 15%, #0a1a3a 0%, transparent 55%),
+radial-gradient(ellipse at 85% 85%, #1a0a3a 0%, transparent 55%),
+radial-gradient(ellipse at 50% 50%, #0a2a1a 0%, transparent 70%), #000;
+animation:shift 25s ease-in-out infinite}
+@keyframes shift{0%,100%{transform:scale(1) rotate(0)}50%{transform:scale(1.15) rotate(6deg)}}
+.wrap{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:0 20px}
+.hud{padding:calc(env(safe-area-inset-top) + 20px) 0 20px;
+display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
+.logo{font-size:22px;font-weight:800;
+background:linear-gradient(90deg,#fff,#00d4ff,#a855f7,#00ff9d);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+background-size:200% auto;animation:shine 4s linear infinite}
+@keyframes shine{to{background-position:200% center}}
+.logo .dot{display:inline-block;width:6px;height:6px;border-radius:50%;
+background:#00ff9d;margin:0 10px;vertical-align:middle;
+animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.3;transform:scale(0.7)}}
+.hud .meta{font-size:11px;color:#888;letter-spacing:1px}
+.hud .meta b{color:#00ff9d}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));
+gap:10px;margin-bottom:20px}
+.stat{background:rgba(20,20,30,0.6);border:1px solid rgba(255,255,255,0.08);
+border-radius:12px;padding:12px;text-align:center;backdrop-filter:blur(20px)}
+.stat .n{font-size:22px;font-weight:800;color:#00d4ff;font-family:monospace}
+.stat .l{font-size:10px;color:#888;letter-spacing:1.5px;text-transform:uppercase;margin-top:4px}
+.search{display:flex;gap:10px;margin-bottom:16px}
+.search input{flex:1;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);
+color:#fff;padding:16px 24px;border-radius:28px;font-size:16px;outline:none;font-family:inherit;
+backdrop-filter:blur(30px);transition:all 0.2s}
+.search input:focus{border-color:#00d4ff;background:rgba(0,212,255,0.08);
+box-shadow:0 0 40px rgba(0,212,255,0.25)}
+.search input::placeholder{color:rgba(255,255,255,0.4)}
+.search button{width:56px;height:56px;border-radius:50%;border:none;
+background:linear-gradient(135deg,#00d4ff,#0088cc);color:#000;font-size:22px;
+font-weight:700;cursor:pointer;box-shadow:0 8px 32px rgba(0,212,255,0.35);
+transition:all 0.15s}
+.search button:active{transform:scale(0.9)}
+.filters{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+.chip{padding:7px 14px;border-radius:20px;background:rgba(255,255,255,0.06);
+border:1px solid rgba(255,255,255,0.1);font-size:11px;color:#aaa;cursor:pointer;
+transition:all 0.2s;font-family:monospace;user-select:none}
+.chip.on{background:linear-gradient(135deg,#00d4ff,#0088cc);color:#000;
+border-color:transparent;font-weight:700}
+.stats-bar{display:flex;gap:12px;padding:10px 16px;background:rgba(0,212,255,0.06);
+border-radius:12px;margin-bottom:16px;font-size:11px;color:#888;flex-wrap:wrap;align-items:center}
+.stats-bar .item b{color:#00d4ff;font-weight:700}
+.stats-bar .src{padding:2px 8px;background:rgba(255,255,255,0.05);
+border-radius:8px;font-family:monospace;font-size:10px;color:#00ff9d}
+.card{background:rgba(20,20,30,0.55);backdrop-filter:blur(30px);
+border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:18px 20px;
+margin-bottom:12px;transition:all 0.22s;text-decoration:none;color:inherit;display:block;
+animation:cardIn 0.3s ease}
+@keyframes cardIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.card:hover,.card:active{transform:translateY(-3px);
+border-color:rgba(0,212,255,0.5);background:rgba(20,20,40,0.75);
+box-shadow:0 20px 60px rgba(0,0,0,0.5),0 0 0 1px rgba(0,212,255,0.2)}
+.card-head{display:flex;justify-content:space-between;align-items:flex-start;
+gap:12px;margin-bottom:8px}
+.card-title{font-size:15px;font-weight:600;color:#fff;line-height:1.35;flex:1;word-wrap:break-word}
+.card-score{font-size:10px;color:#00d4ff;font-weight:700;
+background:rgba(0,212,255,0.12);padding:4px 10px;border-radius:12px;
+font-family:monospace;flex-shrink:0}
+.card-snippet{font-size:13px;color:#aaa;line-height:1.55;margin-bottom:10px;word-wrap:break-word}
+.card-meta{display:flex;justify-content:space-between;font-size:11px;color:#666;
+gap:10px;flex-wrap:wrap;align-items:center}
+.card-src{padding:3px 10px;background:rgba(0,255,157,0.08);color:#00ff9d;
+border-radius:10px;font-family:monospace;font-size:10px}
+.card-url{color:#0088cc;font-family:monospace;font-size:10px;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap;max-width:250px}
+.loading{text-align:center;padding:60px 0;color:#888}
+.spinner{width:60px;height:60px;margin:0 auto 20px;border-radius:50%;
+background:conic-gradient(from 0deg,#00d4ff,#a855f7,#ff6ec7,#00d4ff);
+position:relative;animation:spin 1.4s linear infinite;
+box-shadow:0 0 60px rgba(0,212,255,0.5)}
+.spinner::after{content:"";position:absolute;inset:8px;border-radius:50%;background:#000}
+@keyframes spin{to{transform:rotate(360deg)}}
+.empty{text-align:center;padding:60px 20px;color:#666}
+.empty .icon{font-size:60px;margin-bottom:20px;opacity:0.5}
+.panel{background:rgba(20,20,30,0.5);border:1px solid rgba(255,255,255,0.08);
+border-radius:14px;padding:16px;margin-bottom:16px}
+.panel h2{font-size:11px;color:#888;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}
+.words{display:flex;flex-wrap:wrap;gap:6px}
+.word{padding:4px 10px;background:rgba(0,212,255,0.08);border-radius:10px;
+font-size:11px;color:#00d4ff;font-family:monospace}
+.word b{color:#fff}
+.btn{padding:10px 18px;border-radius:10px;border:1px solid rgba(255,255,255,0.1);
+background:rgba(255,255,255,0.05);color:#fff;font-size:12px;cursor:pointer;
+font-family:monospace;margin-right:8px;margin-bottom:8px;transition:all 0.2s}
+.btn:hover{border-color:#00d4ff;color:#00d4ff}
+.btn.start{background:linear-gradient(135deg,#00ff9d,#00d4ff);color:#000;
+border:none;font-weight:700}
+.btn.stop{background:linear-gradient(135deg,#f87171,#ff1744);color:#fff;
+border:none;font-weight:700}
+@media (max-width:500px){
+.wrap{padding:0 14px}
+.logo{font-size:17px}
+.stats{grid-template-columns:repeat(2,1fr)}
+.stat .n{font-size:18px}
+.search input{padding:14px 20px;font-size:15px}
+.search button{width:50px;height:50px;font-size:20px}
+.card{padding:14px 16px}
+.card-title{font-size:14px}
+.card-snippet{font-size:12px}
+}
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<div class="wrap">
+
+<div class="hud">
+<div class="logo">NEXUS <span class="dot"></span> OMEGA</div>
+<div class="meta">v3.0.0 · <b>Aissa Mohammedi (DGK)</b></div>
+</div>
+
+<div class="stats">
+<div class="stat"><div class="n" id="s-docs">0</div><div class="l">Index</div></div>
+<div class="stat"><div class="n" id="s-terms">0</div><div class="l">Termes</div></div>
+<div class="stat"><div class="n" id="s-queue">0</div><div class="l">Queue</div></div>
+<div class="stat"><div class="n" id="s-rate">0</div><div class="l">Pages/min</div></div>
+</div>
+
+<div class="search">
+<input id="q" placeholder="Chercher sur le web + index local..." autocomplete="off" autofocus
+onkeydown="if(event.key==='Enter')doSearch()">
+<button onclick="doSearch()">→</button>
+</div>
+
+<div class="panel">
+<h2>Indexer</h2>
+<button class="btn start" onclick="startIndexer()">START</button>
+<button class="btn stop" onclick="stopIndexer()">STOP</button>
+<button class="btn" onclick="seedDefault()">Seeds</button>
+<button class="btn" onclick="addWikipedia()">+100 Wikipedia</button>
+<button class="btn" onclick="viewQueue()">Queue</button>
+</div>
+
+<div id="stats-bar" class="stats-bar" style="display:none"></div>
+
+<div id="results">
+<div class="empty">
+<div class="icon">🔍</div>
+<div style="font-size:16px;color:#aaa;margin-bottom:8px">NEXUS SEARCH OMEGA</div>
+<div style="font-size:12px">10 sources + index local · Zéro tracking</div>
+</div>
+</div>
+
+<div class="panel" style="margin-top:20px">
+<h2>Top termes</h2>
+<div class="words" id="words-cloud">Chargement...</div>
+</div>
+
+</div>
+
+<script>
+async function jget(url) {
+try {
+const r = await fetch(url);
+return await r.json();
+} catch(e) { return {}; }
+}
+
+async function jpost(url, body) {
+try {
+const r = await fetch(url, {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify(body || {})
+});
+return await r.json();
+} catch(e) { return {}; }
+}
+
+async function loadStats() {
+const d = await jget('/api/stats');
+document.getElementById('s-docs').textContent = d.pages || 0;
+document.getElementById('s-terms').textContent = d.terms || 0;
+document.getElementById('s-queue').textContent = (d.crawler && d.crawler.queue) || 0;
+document.getElementById('s-rate').textContent = (d.crawler && d.crawler.rate_per_min) || 0;
+}
+
+async function loadWords() {
+const d = await jget('/api/top-terms?limit=25');
+const el = document.getElementById('words-cloud');
+el.innerHTML = (d.terms || []).map(t =>
+`<span class="word">${escapeHtml(t.term)} <b>${t.df}</b></span>`
+).join('') || '<span style="color:#666">Aucun terme indexe</span>';
+}
+
+async function startIndexer() {
+await jpost('/api/indexer/start', {workers: 8});
+loadStats();
+}
+
+async function stopIndexer() {
+await jpost('/api/indexer/stop');
+loadStats();
+}
+
+async function seedDefault() {
+const d = await jpost('/api/seed');
+alert(d.added + ' seeds ajoutes');
+loadStats();
+}
+
+async function addWikipedia() {
+const d = await jpost('/api/seed-wikipedia', {count: 100});
+alert(d.added + ' URLs Wikipedia ajoutees');
+loadStats();
+}
+
+async function viewQueue() {
+const d = await jget('/api/queue');
+alert('Queue: ' + d.pending + ' en attente');
+}
+
+async function doSearch() {
+const q = document.getElementById('q').value.trim();
+if (!q) return;
+const res = document.getElementById('results');
+res.innerHTML = '<div class="loading"><div class="spinner"></div><div>Recherche dans 10 sources...</div></div>';
+document.getElementById('stats-bar').style.display = 'none';
+
+try {
+const d = await jget('/api/search?q=' + encodeURIComponent(q) + '&limit=40');
+if (!d.results || !d.results.length) {
+res.innerHTML = '<div class="empty"><div class="icon">?</div><div>Aucun resultat pour "' + escapeHtml(q) + '"</div></div>';
+return;
+}
+const sb = document.getElementById('stats-bar');
+sb.style.display = 'flex';
+sb.innerHTML = `
+<div class="item"><b>${d.count}</b> resultats</div>
+<div class="item"><b>${d.duration_ms}ms</b></div>
+<div class="item"><b>${d.internal_matches}</b> local</div>
+<div class="item"><b>${d.external_matches}</b> externe</div>
+<div class="item">${d.cached ? 'CACHE' : 'LIVE'}</div>
+${(d.sources || []).map(s => `<span class="src">${escapeHtml(s)}</span>`).join('')}
+`;
+res.innerHTML = d.results.map(r => `
+<a class="card" href="${escapeAttr(r.url)}" target="_blank" rel="noopener">
+<div class="card-head">
+<div class="card-title">${escapeHtml(r.title || r.url)}</div>
+<div class="card-score">${r.score_final || r.score}</div>
+</div>
+<div class="card-snippet">${escapeHtml((r.snippet || '').slice(0, 320))}</div>
+<div class="card-meta">
+<div class="card-src">${escapeHtml(r.source || '')}</div>
+<div class="card-url">${escapeHtml((r.url || '').slice(0, 60))}</div>
+</div>
+</a>
+`).join('');
+} catch(e) {
+res.innerHTML = '<div class="empty">Erreur: ' + escapeHtml(e.message) + '</div>';
+}
+}
+
+function escapeHtml(t) {
+const d = document.createElement('div');
+d.textContent = t || '';
+return d.innerHTML;
+}
+function escapeAttr(t) {
+return (t || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+loadStats();
+loadWords();
+setInterval(loadStats, 2000);
+setInterval(loadWords, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 14 · HTTP HANDLER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *a):
+pass
+
+def _json(self, data, code=200):
+try:
+body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "application/json; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("X-Powered-By", "NexusSearch/" + VERSION)
+self.end_headers()
+self.wfile.write(body)
+except Exception:
+pass
+
+def _html(self, content, code=200):
+try:
+body = content.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "text/html; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Cache-Control", "no-cache")
+self.end_headers()
+self.wfile.write(body)
+except Exception:
+pass
+
+def _read_json(self):
+try:
+n = int(self.headers.get("Content-Length", 0))
+if n == 0:
+return {}
+return json.loads(self.rfile.read(n).decode("utf-8"))
+except Exception:
+return {}
+
+def do_GET(self):
+p = urllib.parse.urlparse(self.path)
+path = p.path
+
+if path in ("/", "/index.html"):
+self._html(HTML_PAGE)
+return
+
+if path == "/api/search":
+qs = urllib.parse.parse_qs(p.query)
+q = (qs.get("q", [""])[0] or "").strip()
+limit = int(qs.get("limit", ["40"])[0])
+lang = qs.get("lang", ["fr"])[0]
+if not q:
+self._json({"error": "q required"}, 400)
+return
+result = search(q, lang=lang, limit=limit)
+self._json(result)
+return
+
+if path == "/api/stats":
+stats = IDX.stats()
+stats["crawler"] = INDEXER.status()
+stats["cache"] = cache_stats()
+stats["version"] = VERSION
+stats["sources"] = len(SOURCES)
+self._json(stats)
+return
+
+if path == "/api/top-terms":
+qs = urllib.parse.parse_qs(p.query)
+limit = int(qs.get("limit", ["20"])[0])
+self._json({"terms": IDX.top_terms(limit)})
+return
+
+if path == "/api/queue":
+self._json({"pending": INDEXER.queue_size()})
+return
+
+if path == "/api/indexer":
+self._json(INDEXER.status())
+return
+
+if path == "/health":
+self._json({"status": "ok", "version": VERSION, "auteur": AUTEUR})
+return
+
+self._json({"error": "not found"}, 404)
+
+def do_POST(self):
+path = urllib.parse.urlparse(self.path).path
+payload = self._read_json()
+
+if path == "/api/indexer/start":
+workers = int(payload.get("workers", DEFAULT_WORKERS))
+ok = INDEXER.start(num_workers=workers)
+self._json({"started": ok, "workers": INDEXER.num_workers})
+return
+
+if path == "/api/indexer/stop":
+INDEXER.stop()
+self._json({"stopped": True})
+return
+
+if path == "/api/seed":
+n = seed_indexer()
+self._json({"added": n})
+return
+
+if path == "/api/seed-wikipedia":
+count = int(payload.get("count", 50))
+import random
+topics = [
+"Python_(langage)", "JavaScript", "Rust_(langage)",
+"Go_(langage)", "C%2B%2B", "Java_(langage)",
+"HTML", "CSS", "HTTP", "HTTPS", "JSON", "XML",
+"SQL", "NoSQL", "MongoDB", "PostgreSQL", "MySQL",
+"Linux", "Unix", "Windows", "macOS", "Android", "iOS",
+"Intelligence_artificielle", "Machine_learning",
+"R%C3%A9seau_informatique", "Internet", "World_Wide_Web",
+"Serveur_web", "Apache_HTTP_Server", "Nginx",
+"Docker", "Kubernetes", "Git", "GitHub",
+"Cryptographie", "Chiffrement", "S%C3%A9curit%C3%A9_informatique",
+"Base_de_donn%C3%A9es", "Syst%C3%A8me_d%27exploitation",
+"Compilateur", "Interpr%C3%A9teur", "Algorithmique",
+"Structure_de_donn%C3%A9es", "Complexit%C3%A9_algorithmique",
+"R%C3%A9seau_de_neurones_artificiels", "Apprentissage_profond",
+"Traitement_du_langage_naturel", "Vision_par_ordinateur",
+"Cloud_computing", "Virtualisation", "Programmation_orient%C3%A9e_objet",
+"Programmation_fonctionnelle", "Programmation_proc%C3%A9durale",
+"Compilation", "Optimisation_de_code", "Test_logiciel",
+"M%C3%A9thode_agile", "Scrum_(m%C3%A9thode)", "DevOps",
+"Microservice", "API_REST", "GraphQL", "WebSocket",
+"TCP/IP", "DNS", "Firewall", "Proxy", "VPN",
+"Blockchain", "Bitcoin", "Ethereum", "Contrat_intelligent",
+"Informatique_quantique", "Qubit", "Algorithme_de_Shor",
+"Big_data", "Hadoop", "Spark_(framework)", "MapReduce"
+]
+added = 0
+for _ in range(count):
+topic = random.choice(topics)
+url = "https://fr.wikipedia.org/wiki/" + topic
+if INDEXER.add_url(url, priority=1):
+added += 1
+self._json({"added": added})
+return
+
+self._json({"error": "not found"}, 404)
+
+
+class Server(ThreadingHTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 15 · MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+print("")
+print("=" * 72)
+print(" NEXUS SEARCH · OMEGA EDITION v" + VERSION)
+print(" Multi-Source + Local Indexer + Formatter")
+print(" Auteur : " + AUTEUR)
+print(" Licence : " + LICENCE)
+print("=" * 72)
+print("")
+print(" URL : http://127.0.0.1:" + str(PORT) + "/")
+print(" Sources : " + str(len(SOURCES)) + " externes")
+print(" Workers : " + str(DEFAULT_WORKERS))
+print(" DB : " + DB_FILE)
+print(" Logs : " + LOGS_DIR)
+print("")
+print(" API :")
+print(" GET /api/search?q=...")
+print(" GET /api/stats")
+print(" GET /api/top-terms")
+print(" POST /api/indexer/start")
+print(" POST /api/indexer/stop")
+print(" POST /api/seed")
+print(" POST /api/seed-wikipedia")
+print("=" * 72)
+print("")
+
+# Seed + start indexer automatiquement
+n = seed_indexer()
+if n > 0:
+ilog("Seeds initiaux ajoutes : " + str(n))
+
+INDEXER.start(num_workers=DEFAULT_WORKERS)
+
+try:
+server = Server((HOST, PORT), Handler)
+server.serve_forever()
+except KeyboardInterrupt:
+INDEXER.stop()
+print("\nArrete.")
+except OSError as e:
+print("Port " + str(PORT) + " : " + str(e))
+
+
+if __name__ == "__main__":
+try:
+main()
+except KeyboardInterrupt:
+print("\nArrete.")
+except Exception as e:
+print("[FATAL] " + str(e))
+import traceback
+traceback.print_exc()
+sys.exit(1)
